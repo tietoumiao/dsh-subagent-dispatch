@@ -1,0 +1,33 @@
+# dsh-subagent-dispatch bundle layer — applied when a profile lists this
+# package in dsh.profile.bundles (dsh.bundle.patch declaration).
+#
+# One row mounts two Host tools and two subagent providers (see lib/index.js):
+#   1. the `dispatch_subagent` Host tool — per-call preset / reasoning_effort /
+#      model / provider / cwd / schema, backed by the local provider
+#      `dispatch-local`;
+#   2. the `run_workflow` Host tool — whole-run preset / reasoning_effort /
+#      provider+model / max_total_agents, plus run_in_background. As of 0.5.0
+#      the stock `workflow` tool is TAKEN OVER per agent instead of denied
+#      (同名接管 = same-name takeover ⇒ a real redirect): a
+#      definition from the same `buildWorkflowDefinition` factory (same
+#      `executeWorkflow`) is registered in each agent's OWN scope, so
+#      `workflow` and `run_workflow` are two names for ONE implementation and
+#      a `workflow` call is a real redirect (own layer wins over inherited,
+#      dsh-tools 'view()'). `shadowStockWorkflow` (default true) is the master
+#      switch, `takeoverToolName` (default `workflow`) renames the takeover;
+#      execution-time `tools.guard` survives only as the fallback for an agent
+#      whose own scope already holds somebody else's same-name tool;
+#   3. the external subagent provider `dispatch` — whole-run preset + effort
+#      for workflow agent() / subagentProvider, resolved through
+#      ctx.subagents.startActivation.
+#
+# No row-level `config` block on purpose. The plugin does NOT export a Config
+# schema: `apply(ctx, config = {})` reads providerName / localProviderName /
+# delegateProviderName / preset / reasoningEffort / routeProvider / model /
+# shadowStockWorkflow / takeoverToolName / shadowedToolNames straight off the
+# row's config object and falls back to built-in defaults, so a profile can
+# override any of them later (omitting a field just keeps its default) without
+# editing this file. Keep that contract when changing lib/index.js.
+- insert:
+    - id: dsh-subagent-dispatch
+      name: 'dsh-subagent-dispatch'

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "子智能体派发",
+    "description": "按次指定 preset、推理档位、model、provider、工作目录与输出 schema 派发子智能体（dispatch_subagent 工具）；用 workflow / run_workflow 两个工具按轮运行 workflow —— 两个名字同一实现（同一 executeWorkflow + 同一工厂产出），因为 workflow 这个名字由同名接管注册进每个 agent 的 own 作用域（真重定向，不是拒绝）；并注册 external 子智能体 provider `dispatch` 供 workflow 整轮委派使用。"
+  }
+}

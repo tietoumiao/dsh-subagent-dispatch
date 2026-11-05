@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Subagent Dispatch",
+    "description": "Dispatch a subagent with a per-call preset, reasoning effort, model, provider, working directory, and output schema (dispatch_subagent tool); run one workflow with per-run settings through the `workflow` and `run_workflow` tools — two names for the same implementation (same executeWorkflow, same definition factory), because `workflow` is taken over by a same-name registration in each agent's own scope (a real redirect, never a denial); and expose an external `dispatch` subagent provider for whole-run workflow delegation."
+  }
+}
