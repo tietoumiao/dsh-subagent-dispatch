@@ -327,6 +327,29 @@ preset / effort 入口；`run_workflow` 与 `subagentProvider: 'dispatch'` 是�
   （后续 `finish` / `abandon` 空转，不抛错）；append 抛错只 `warn` 一次并停用该 run。库存无条件读 `session.append` ⇒
   **记录能力等价、形态有差异**。
 
+## PTC 档（dsh-ops）：自动引擎兜底
+
+官方 `ptc` 预设（`@deepseek-ai/dsh-web-app/presets/ptc.patch.yml`）把 `workflow-ptc` 与 `tool-workflow` 两行标成
+`disabled: true`，而 `standard` / `cordis` 没有；dsh-ops 只增强工具面、不补引擎。所以 PTC 会话里的 `run_workflow`
+曾经是“工具目录里有、一调就报 `no workflow engine`”的死条目。
+
+`lib/index.js` 的 `resolveWorkflowEngine` 现在这样处理一次调用：
+
+- 先走原有五级解析（`agentPresets.serviceFor` → `agent.ctx` → 插件 ctx）；命中就直接用，**不挂任何东西**。
+- 都没命中、且宿主有 `ptcRuntime`（`language === 'typescript'`）时，首次调用按需
+  `await import('@deepseek-ai/dsh-workflow-ptc')`，再 `ctx.plugin(Engine, { provider: 'spawn' })` 挂载官方引擎；
+  成功后缓存，**失败不缓存**、下次可重试；缓存项每次用前按 `ctx.get('workflowEngine')` 身份复验，fiber 被回收就重挂。
+- 没有 PTC runtime / import 失败 / 挂载抛错时，错误串固定说明：preset 未启用引擎 + 失败原因 +
+  两条修法（在 preset 里启用 `workflow-ptc` + `tool-workflow`，或安装 `@deepseek-ai/dsh-workflow-ptc`）。
+- `apply(ctx, { autoMountPtcEngine: false })` 关闭兜底，回到只读行为。
+
+语义边界：兜底引擎是**进程级**的、活到插件卸载；`serviceFor` 先于兜底，所以自带引擎的预设（standard / cordis /
+自定义带 `workflow-ptc` 的预设）行为不变。引擎的 `workflow/*` 事件走全局事件总线，UI 与 recorder 仍能收到。
+`@deepseek-ai/dsh-workflow-ptc` 是**动态 import**，不进加载期依赖：没有该包的宿主照样加载本插件，只在调用期回退报错。
+
+对应自检用例：`WF_PTC_ENGINE_MOUNT`、`WF_PTC_ENGINE_CACHED`、`WF_PTC_ENGINE_SKIPPED`、
+`WF_PTC_ENGINE_NO_RUNTIME`、`WF_PTC_ENGINE_MOUNT_FAILS`。
+
 ## 自检
 
 ```bash

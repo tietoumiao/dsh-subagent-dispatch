@@ -101,7 +101,7 @@ function resolveBare(specifier) {
     target = isConditionMap ? pick(exportsField) : undefined
     if (target === undefined) target = pick(exportsField?.['.'])
     if (target === undefined && typeof exportsField === 'string') target = exportsField
-    if (target === undefined) target = pkg.module ?? pkg.main
+    if (target === undefined) target = pkg.main ?? pkg.module
   } else {
     const key = `./${subpath}`
     if (exportsField !== undefined && typeof exportsField === 'object') target = pick(exportsField[key])
@@ -512,6 +512,9 @@ function mount(config = {}, options = {}) {
     agentGuards: new Map(),
     agentRegisters: [],
     fiberDisposals: [],
+    // PTC engine fallback seams: the official engine mount records here.
+    pluginMounts: [],
+    mountedEngine: undefined,
   }
   const parent = fakeParent()
   const appendMode = options.sessionAppend ?? 'record'
@@ -622,7 +625,8 @@ function mount(config = {}, options = {}) {
   // preset registry arrives the same way (`ctx.get('agentPresets')`) — that is
   // the only service that can read an agent's isolated preset group.
   ctx.get = (serviceName) => {
-    if (serviceName === 'workflowEngine') return engineMode === 'none' ? undefined : engine
+    if (serviceName === 'workflowEngine') return engineMode === 'none' ? state.mountedEngine : engine
+    if (serviceName === 'ptcRuntime') return options.ptcRuntime
     if (serviceName === 'agentPresets') return agentPresets
     if (serviceName === 'jobs') return options.jobs === 'none' ? undefined : jobs
     // `agents.list()` is the takeover's source for agents that already existed
@@ -635,6 +639,14 @@ function mount(config = {}, options = {}) {
     const handlers = state.listeners.get(event) ?? []
     for (const handler of handlers) handler(...args)
     return handlers.length
+  }
+  // The official engine is mounted through `ctx.plugin` only when no preset
+  // engine resolved. A `pluginThrows` option models a failing mount.
+  ctx.plugin = async (Engine, pluginConfig) => {
+    state.pluginMounts.push({ Engine, config: pluginConfig })
+    if (options.pluginThrows !== undefined) throw new Error(options.pluginThrows)
+    state.mountedEngine = options.mountedEngine ?? engine
+    return { dispose() {} }
   }
   plugin.apply(ctx, config)
   return { ctx, state, parent, engine, jobs, emit }
@@ -1273,6 +1285,73 @@ await probe('WF_NO_ENGINE', async () => {
   if (state.engine.calls.length !== 0) throw new Error('start() was reached without a workflow engine')
   if (TEMP_PREFIX_STATE(state).length !== 0) throw new Error('a provider was registered without a workflow engine')
   return `rejected before dispatch (${messageOf(error).slice(0, 48)}…)`
+})
+
+// The stock `ptc` preset ships `workflow-ptc` / `tool-workflow` disabled, so a
+// PTC agent has no engine at any readable scope. The plugin must mount the
+// OFFICIAL engine on first use — and only then.
+await probe('WF_PTC_ENGINE_MOUNT', async () => {
+  const { state, parent } = mount({}, { engine: 'none', ptcRuntime: { language: 'typescript' } })
+  const tool = state.tools.get(WF_TOOL_NAME)
+  const value = await tool.execute({ script: WF_SCRIPT, meta: WF_META }, execFor(parent))
+  if (state.pluginMounts.length !== 1) throw new Error(`ctx.plugin called ${state.pluginMounts.length} times, expected 1`)
+  const provider = state.pluginMounts[0]?.config?.provider
+  if (provider !== 'spawn') throw new Error(`engine mount provider is ${JSON.stringify(provider)}, expected spawn`)
+  if (state.engine.calls.length !== 1) throw new Error(`engine.start called ${state.engine.calls.length} times, expected 1`)
+  if (value.runId !== state.engine.runs[0].runId) throw new Error('the run id did not come from the mounted engine')
+  return 'no preset engine + ts PTC runtime -> official engine mounted once, run completed'
+})
+
+await probe('WF_PTC_ENGINE_CACHED', async () => {
+  const { state, parent } = mount({}, { engine: 'none', ptcRuntime: { language: 'typescript' } })
+  const tool = state.tools.get(WF_TOOL_NAME)
+  await tool.execute({ script: WF_SCRIPT, meta: WF_META }, execFor(parent))
+  await tool.execute({ script: WF_SCRIPT, meta: WF_META }, execFor(parent))
+  if (state.pluginMounts.length !== 1) throw new Error(`ctx.plugin called ${state.pluginMounts.length} times for 2 calls, expected 1`)
+  if (state.engine.calls.length !== 2) throw new Error(`engine.start called ${state.engine.calls.length} times, expected 2`)
+  return 'the second call reuses the mounted engine (1 mount, 2 starts)'
+})
+
+await probe('WF_PTC_ENGINE_SKIPPED', async () => {
+  const { state, parent } = mount({}, { engine: 'property', ptcRuntime: { language: 'typescript' } })
+  const tool = state.tools.get(WF_TOOL_NAME)
+  await tool.execute({ script: WF_SCRIPT, meta: WF_META }, execFor(parent))
+  if (state.pluginMounts.length !== 0) throw new Error('ctx.plugin was called although a preset engine resolved')
+  if (state.engine.calls.length !== 1) throw new Error('the preset engine was not used')
+  return 'preset engine wins; the fallback is never mounted'
+})
+
+await probe('WF_PTC_ENGINE_NO_RUNTIME', async () => {
+  const { state, parent } = mount({}, { engine: 'none' })
+  const tool = state.tools.get(WF_TOOL_NAME)
+  const error = await rejectsWith(
+    () => tool.execute({ script: WF_SCRIPT, meta: WF_META }, execFor(parent)),
+    /no workflow engine/,
+    'no engine + no PTC runtime',
+  )
+  if (!/TypeScript PTC runtime/.test(messageOf(error))) throw new Error(`the error lacks the runtime reason: ${messageOf(error)}`)
+  if (state.pluginMounts.length !== 0) throw new Error('ctx.plugin was called without a PTC runtime')
+  if (state.engine.calls.length !== 0) throw new Error('start() was reached without an engine')
+  if (TEMP_PREFIX_STATE(state).length !== 0) throw new Error('a provider was registered without an engine')
+  return 'no runtime -> readable error, no mount, no provider, no start'
+})
+
+await probe('WF_PTC_ENGINE_MOUNT_FAILS', async () => {
+  const { state, parent } = mount({}, {
+    engine: 'none',
+    ptcRuntime: { language: 'typescript' },
+    pluginThrows: 'synthetic mount failure',
+  })
+  const tool = state.tools.get(WF_TOOL_NAME)
+  const error = await rejectsWith(
+    () => tool.execute({ script: WF_SCRIPT, meta: WF_META }, execFor(parent)),
+    /no workflow engine/,
+    'a failing engine mount',
+  )
+  if (!/synthetic mount failure/.test(messageOf(error))) throw new Error(`the error lacks the mount cause: ${messageOf(error)}`)
+  if (state.engine.calls.length !== 0) throw new Error('start() was reached after a failed mount')
+  if (TEMP_PREFIX_STATE(state).length !== 0) throw new Error('a provider was registered after a failed mount')
+  return 'mount failure -> original error + cause, no provider, no start'
 })
 
 // The engine lives in the preset scope of the CALLING AGENT, not in this

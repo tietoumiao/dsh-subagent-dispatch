@@ -99,6 +99,20 @@
    临时 provider 是**一次调用一份**：名字唯一（`dispatch-wf:<uuid>`）、`finally` 里调 disposer 释放，
    不带 `preset` / `reasoning_effort` / `provider`+`model` 时**不注册**、`subagentProvider` 也不传。
 
+## PTC 档（dsh-ops）的引擎兜底
+
+标准 `ptc` 预设默认把 `workflow-ptc` / `tool-workflow` 两行 `disabled: true`（`standard` / `cordis` 则启用）。
+本插件的 `run_workflow` 在五级解析全部落空、且宿主有 TypeScript `ptcRuntime` 时，会按需动态 import 官方
+`@deepseek-ai/dsh-workflow-ptc` 并在插件 ctx 上 `ctx.plugin(Engine, { provider: 'spawn' })` 挂载一次：
+
+- **触发口径**：只看**调用方 agent** 的五级解析结果；`serviceFor` 命中（standard / cordis / 自定义带引擎的预设）时
+  绝不挂载。兜底引擎是进程级、活到插件卸载。
+- **失败口径**：无 `ptcRuntime` / import 失败 / 挂载抛错 ⇒ 保持原“no workflow engine”错误并附原因与两条修法
+  （preset 启用两行，或安装 `@deepseek-ai/dsh-workflow-ptc`）；不注册临时 provider、不启动 run。
+- **关闭开关**：`autoMountPtcEngine: false`。
+- **证据**：`scripts/check.mjs` 的 `WF_PTC_ENGINE_MOUNT` / `_CACHED` / `_SKIPPED` / `_NO_RUNTIME` / `_MOUNT_FAILS`
+  为假 ctx 探针（已实测）；真机 PTC 会话需重启后 smoke（**未验证**，见 `worklogs/flowntier/wf-pct-workflow-20261106/07-report.md`）。
+
 ## 结论行
 
 - **`workflow` 与 `run_workflow` 是同一实现的「两个名字」**（0.5.0，同名接管）：同名定义注册进每个已经能看见
