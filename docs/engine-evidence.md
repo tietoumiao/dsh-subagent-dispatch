@@ -10,7 +10,10 @@
 
 宿主根（桌面版默认安装位置）：`%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\app\dsh\node_modules\@deepseek-ai`
 下文 `$D` 指上述目录（与下文 `$H` 同义）。
-复现方式：`sed -n '<行>p' "$H/<文件>"`（`H` 即上述目录）。下文行号全部**逐条实测**取过原文。
+**复现方式（0.6.0 校正）**：下文行号取自 **0.2.1-rc.2** 的解包快照；当前安装是 **0.2.2-rc.1**，其中
+`dsh-tools` 等包被重新打包（实现搬进 `lib/shared-*.js`），行号整体漂移，**不要按行号复现**。
+请按符号名复现：`grep -n "<符号>" "$H/<包>/lib/index.js" "$H/<包>/lib/shared-"*.js`。
+0.2.2-rc.1 上重新核对过的锚点表见 §12。
 
 ---
 
@@ -293,7 +296,9 @@ the calling agent's context (agent.ctx.workflowEngine, agent.ctx.get('workflowEn
 
 ### 9.8 这一节**没有**验证的
 
-- 本机装的仍是 **0.2.1-rc.2**，0.2.2-rc.1 只做了**静态源码比对**，没有把插件装到 0.2.2-rc.1 上跑过。
+- 本节（§9）的比对是**静态源码比对**。本机现在装的是 **0.2.2-rc.1**：`scripts/check.mjs` 的 68 例与
+  `scripts/probe-disclosure.mjs` 的 10 条断言都在该版本的宿主模块上实跑过，但**0.2.1-rc.2 一侧没有实跑**
+  （只有源码比对）——这两件事不要互相替代。
 - `_tmp\v022\` 是解包产物，不是 npm 完整依赖树；「0.2.2-rc.1 的 `dsh-tools` 行号」这类需要行号一致的断言，
   本节一律不写。
 - 9.2 ~ 9.4 的三条结论只覆盖**这几个接缝**；`dsh-subagent` 其余改动（settlement / projections）是否影响
@@ -301,13 +306,14 @@ the calling agent's context (agent.ctx.workflowEngine, agent.ctx.get('workflowEn
 
 ---
 
-## 10. 库存 `dsh-tool-workflow` 的对外可观察能力（0.5.0「两个名字」的对齐依据）
+## 10. 库存 `dsh-tool-workflow` 的对外可观察能力（单条披露的对齐依据）
 
-**本节用途**：**`workflow` 与 `run_workflow` 是同一实现的两个名字**。库存 `workflow` 工具
-（`@deepseek-ai/dsh-tool-workflow`）的五项对外可观察能力——后台 job、进度事件、运行记录、结果截断、
-systemPrompt 指引——由本插件等价实现；库存工具本身由**同名接管**（0.5.0）在 agent 的 own 作用域里被同名压住，
-模型调 `workflow` 即**真重定向**到本插件的 `executeWorkflow`（`shadowStockWorkflow: false` 可关，见 §10.5；
-v0.4.0 的旧做法是 `ctx.tools.guard` 执行期拒绝，现只作兜底，见 §10.3）。
+**本节用途**：0.6.0 起模型侧**单条披露**——每个本来就能看见 `workflow` 的 agent，工具视图里 workflow 能力**恰好一条**，
+名字是库存名 `workflow`；`run_workflow` 降级为**别名**，默认隐藏（`exposeRunWorkflow: true` 恢复单独披露，
+`shadowStockWorkflow: false` 兼容模式）。库存 `workflow` 工具（`@deepseek-ai/dsh-tool-workflow`）的五项对外可观察能力——
+后台 job、进度事件、运行记录、结果截断、systemPrompt 指引——由本插件等价实现；库存工具本身由**同名接管**在 agent 的
+own 作用域里被同名压住，模型调 `workflow` 即**真重定向**到本插件的 `executeWorkflow`（见 §10.5）。
+v0.4.0 的旧做法是 `ctx.tools.guard` 执行期拒绝，现只作兜底（见 §10.3）。
 
 **行号口径（重要）**：本节行号**全部**取自宿主安装根 0.2.1-rc.2 的
 `$H/dsh-tool-workflow/lib/index.js`（下文 `$T`，442 行），每条都能用 `sed -n '<行>p' "$T"` 复现原文；
@@ -324,7 +330,7 @@ v0.4.0 的旧做法是 `ctx.tools.guard` 执行期拒绝，现只作兜底，见
 | 取消链 | `:239-241`（`cancel: (reason) => run.cancel(reason ?? 'background workflow job killed')`） | job 的 `cancel` 调 `run.cancel` | 同形：`job_kill` → `jobs.kill` → `hooks.cancel` → `run.cancel('background workflow job killed')`（宿主侧 `dsh-tool-jobs/lib/index.js:406` → `dsh-jobs-local/lib/index.js:644-655` `killJob` → `job.cancel(reason)`） |
 | 结算语义 | `:242-254`（`done`）→ `:178-196`（`jobOutcomeOf`） | `done`：先 `run.dispose()`（失败只 warn `:245-247`）、mirror 停、recorder finish+abandon，再 `jobOutcomeOf(result, meta.name, maxResultChars)`；completed → `{status:'completed', detail:'N agent(s)', result: 截断文本}`（`:180-184`），cancelled → `{status:'killed'}`（`:185`），error → `{status:'failed', detail}`（`:186-189`） | 同形：结算顺序与三种 stopReason 映射一致 |
 | 结果截断 | `:68`（`maxResultChars: z.natural().min(1).default(5e4)`）、`:198-202`（`renderResult`）、`:382`（render 用同一函数） | 前缀 `workflow "<name>" completed (N agent(s)).\nReturn value:\n`；超长 `rendered.slice(0, maxChars) + '\n… [truncated: N more characters]'` | 同函数语义：配置项 `maxResultChars` 默认 50000，前台 render 与后台 job 结果都走同一 `renderResult`，后缀逐字相同（`… [truncated: N more characters]`） |
-| systemPrompt 指引 | `:64-66`（`inject` 含 `systemPrompt`）、`:265-269`（`ctx.systemPrompt.section`）、`:267`（`order`） | `order: ctx.systemPrompt.getSectionOrder('TOOL_WORKFLOW')`；`name: 'tool:' + toolName`；text 指向本工具 | 注册一条同类 section：`order` 取 `TOOL_WORKFLOW`（= **2600**，`dsh-system-prompt/lib/index.js:31`；`getSectionOrder` 定义 `:262`），text 明确「workflow 请用 `run_workflow`」 |
+| systemPrompt 指引 | `:64-66`（`inject` 含 `systemPrompt`）、`:265-269`（`ctx.systemPrompt.section`）、`:267`（`order`） | `order: ctx.systemPrompt.getSectionOrder('TOOL_WORKFLOW')`；`name: 'tool:' + toolName`；text 指向本工具 | 注册**一条** section：`order` 取 `TOOL_WORKFLOW`（= **2600**，`dsh-system-prompt/lib/index.js:31`；`getSectionOrder` 定义 `:262`），`name` 取 `tool:workflow`，**正文逐字等于库存 section 文本**（不含 takeover / executeWorkflow / two names / run_workflow） |
 | 输出 schema | `:339-379`（`oneOf` 两支）、`:380-383`（render）、`:417-422`（前台返回值 `kind: 'foreground'`） | 两支 `oneOf`：`background`(`jobId`/`runId`) 与 `foreground`(`runId`/`agentsStarted`/`result`)，各支 `additionalProperties: false` | 同形 `oneOf` + 同形 render（后台文案点名 `job_output` / `job_kill`） |
 | 参数 | `:333-335`（`run_in_background`） | 布尔、默认 false；`true` 才走后台 | 同名参数 `run_in_background`（默认 false） |
 | systemPrompt 顺序常量 | `dsh-system-prompt/lib/index.js:31` | `TOOL_WORKFLOW: 2600,` | 直接复用该常量取序，不自造数值 |
@@ -407,6 +413,65 @@ v0.4.0 的旧做法是 `ctx.tools.guard` 执行期拒绝，现只作兜底，见
 
 ---
 
+### 10.6 单条披露 / 原版同形 / 别名 / PTC 的证据（0.6.0）
+
+**单条披露的判定链**：每个 agent 的 own 层注册同名 `workflow` ⇒ `view(scope)` 的 visible 里 own 覆盖 inherited
+（§10.5 事实 1）⇒ 模型面 workflow 形状的名字集合 = `['workflow']`；插件作用域的 `run_workflow` **默认不注册**
+（「隐藏」= 不注册全局别名，宿主没有 register-but-hide API）⇒ 不会出现第二条。测试用例 `WF_ALIAS_HIDDEN` 断言：
+own 层恰好 `[workflow]`、可见 workflow 形状名恰好 `['workflow']`、全局无 `run_workflow`。
+
+**原版同形（运行时捕获，不切源码）**：库存模块只导出 `Config / apply / inject / name`，`DESCRIPTION` 不导出；
+`scripts/check.mjs` 的 `stockWorkflowBaseline()` 把库存 `apply()` 施加到最小 fake ctx（并且**必须**传
+`stockWorkflowModule.Config({})`，否则 stock 的 `toolName` 是 `undefined`，见计划 OI4），捕获它注册的
+`definition` 与 `section`，再与本插件定义比较：
+
+| 断言 | 结果 |
+|---|---|
+| `description` 字符串 `===` | PASS（库存 `DESCRIPTION` = **1667 字符**，`node -e` 从库存源模板串复算 1667，与运行时捕获一致） |
+| 四个库存参数 `script` / `meta` / `args` / `run_in_background` 逐字段 `canonicalJson` 深等 | PASS |
+| 根 `required` = `['script','meta']` | PASS |
+| `meta` 结构深等（`additionalProperties:true`、`required:['name','description']`、`phases.items.title` 必填） | PASS |
+| 新增参数集合恰好 `['max_total_agents','model','preset','provider','reasoning_effort']` 且**都非 required** | PASS |
+
+**一条 section、库存逐字、不泄漏实现、按作用域落位**：`WF_SECTION_STOCK_ONCE` 读**运行时捕获并合并作用域链后**的 section
+（不是源码切片），断言 `length === 1`、`text === stock.section.text`、`name === 'tool:workflow'`、`order === 2600`，文本不命中
+`/takeover|executeworkflow|two names|run_workflow/i`；`WF_SYSTEM_PROMPT_SECTION` 断言接管激活时**全局 0 条**（规则注册在
+agent 自己的作用域）；`WF_SECTION_SHADOWS_STOCK` 断言预设层的同名 section 被 agent 层 shadow 且预设层对象未被改写。
+宿主依据：`dsh-system-prompt` 的 `SystemPrompt.section()` 走 `layers.effect(this.ctx, …)`（**调用方作用域**，Cordis 的
+`Service.tracker` 会把 `this.ctx` 重绑到访问者），`ScopedLayers.merge()` 按名合并、`chainLayers()` 由远到近 ⇒ 近者胜；
+同层重名才会由 `NamedEntries` 抛错。库存 section 原文（`$T:265-269`）：
+
+```text
+Use the workflow tool ONLY when the user explicitly asks for a workflow or for large multi-agent orchestration: you write a JavaScript script (the tool description documents the exact format) that fans work out across many subagents with phases and structured results. For one or two delegations, prefer plain subagent calls.
+```
+
+**别名兼容**：`run_workflow` 未被删除，实现与定义保留；**默认不注册**（模型侧不披露）。`WF_ALIAS_SWITCH` 断言两条恢复路径：
+`exposeRunWorkflow: true` 时插件作用域出现 `run_workflow` 且**接管仍在**（只恢复别名，不改接管）；
+`shadowStockWorkflow: false` 时 `run_workflow` 恢复、无 `agent/created` 监听、无 guard（兼容模式）。两条路径发布的
+都是同一 `buildWorkflowDefinition` 产物（同一 description / 参数表 / `executeWorkflow`）。
+
+**PTC 的 `tools:sdk` 单条**：PTC 的 `run_code` 由执行器 `describe()` 声明，不进 registry（计划 OI1：真宿主的
+`view.visible` 恒不含 `run_code`），所以补位判定改问 `tools.selectExecutor(agent).describe().knownNames`。`WF_PTC_SUPPLEMENT`
+用**真实** `@deepseek-ai/dsh-tool-executor-ptc` 的 `renderToolsSdk` 渲染可见工具（排除 `run_code`），断言
+`interface ToolArgsMap` 段里 `workflow:` 绑定行**恰好 1 条**、不出现 `run_workflow`，并直接 `execute` 补位定义得到
+`{kind:'foreground', runId}`。`restrict` 的 agent 走 `WF_RESTRICT_NO_GRANT`：`knownNames` 含但 visible 不含 ⇒ 0 注册。
+PTC 预设自身已启用库存 `workflow` 的组合（OI2）在单元层按「已可见 ⇒ 重定向」处理，未在真机观测。
+
+**三档（写死）**
+
+| 项 | 档位 | 证据 / 原因 |
+|---|---|---|
+| 68 例自检全绿 | **已实测** | `DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 68 passed` / `result: OK`（exit 0） |
+| 单条披露 / 原版同形 / 一条 section / 别名开关 / restrict 不扩张 / PTC 补位单条 | **已实测（单元）** | `WF_ALIAS_HIDDEN` / `WF_STOCK_DEFINITION_PARITY` / `WF_SECTION_STOCK_ONCE` / `WF_ALIAS_SWITCH` / `WF_RESTRICT_NO_GRANT` / `WF_PTC_SUPPLEMENT` 各 PASS |
+| 标准/cordis 形态工具面单条 + section 一条 | **已实测（真实 Cordis 集成）** | ``scripts/probe-disclosure.mjs` 标准段 6/6 PASS（真 `tools.view()` / `systemPrompt.assemble()`） |
+| 标准/cordis 档**活宿主**重扫 | **未验证** | 运行中宿主是改动前旧模块（`link:` + 模块缓存），需重启复验 |
+| PTC 形态补位 + 单条 section | **已实测（真实 Cordis 集成）** | 同一探针 PTC 段 4/4 PASS |
+| PTC **活宿主** `tools:sdk` 单条 + `await tools.workflow` 跑完 | **未验证** | 既有真机记录在旧模块上（本机 worklog 的 `evidence/ptc-real.json`，未随包发布；`realCall: "undeterminable"`），不得宣称已验证 |
+| section 是否进入最终 prompt | **未验证** | 只断言注册对象（order/name/text），未捕获真机 prompt |
+| 后台 job 进度 UI / 真机 `job_kill` / 热重载残留定义 | **未验证** | 假 ctx 探针测不到，未做真机 smoke |
+| 0.2.2-rc.1 运行时 | **已实测（本机即是该版本）** | 68 例自检 + 10 条集成断言都在 0.2.2-rc.1 的宿主模块上实跑 |
+| `dispatch` provider 本体 | **无法判定** | external provider 活宿主未跑通，只有请求形状断言 |
+
 ## 结论（写死）
 
 - **workflow `agent()` 的 `reasoning_effort` 只能 per-run 生效，不是 per-call**：`effort` 在 `DEFERRED_AGENT_OPTIONS`
@@ -422,28 +487,31 @@ v0.4.0 的旧做法是 `ctx.tools.guard` 执行期拒绝，现只作兜底，见
   结构上不触发 external 的 `childId = run.id` 冲突。
 - external provider 返回**合成 id** `dispatch:<uuid>`，不取内层 `childId`（0.2.1-rc.2 `:1783-1789`；
   0.2.2-rc.1 `:1789` `childId = run.id;`、`:1793` `await run.dispose();`）。
-- **0.5.0 起 `workflow` 与 `run_workflow` 是同一实现的两个名字**：库存 `workflow` 工具的后台 job / 进度事件 / 运行记录 /
-  结果截断 / systemPrompt 指引五项对外可观察能力由本插件等价实现（§10 逐条给出库存行号与原文要点），
-  库存工具的名字由**同名接管**在 agent own 层压住（`shadowStockWorkflow: false` 可关，宿主依据见 §10.5）。
-  **接管 ≠ 工具列表隐藏**：那一条 `workflow` 的定义换成了本插件这份，调用是**真执行**；
-  执行期拒绝（guard）只作兜底（§10.3，v0.4.0 的旧做法）。
+- **0.6.0 起模型侧单条披露**：默认只披露库存名 `workflow`（同名接管后的本插件定义）；`run_workflow` 降级为兼容别名、默认不注册（实现保留）
+  **别名**、默认隐藏（`exposeRunWorkflow: true` 恢复单独披露；`shadowStockWorkflow: false` 兼容模式回到两套入口）。
+  库存 `workflow` 工具的后台 job / 进度事件 / 运行记录 / 结果截断 / systemPrompt 指引五项对外可观察能力由本插件等价
+  实现（§10 逐条给出库存行号与原文要点），库存工具的名字由**同名接管**在 agent own 层压住（宿主依据见 §10.5）。
+  **接管 ≠ 工具列表隐藏**：那一条 `workflow` 的定义换成了本插件这份，调用是**真执行**；执行期拒绝（guard）只作兜底
+  （§10.3，v0.4.0 的旧做法）。
 
 ## 未验证项（诚实边界）
 
 - **`dispatch` provider 本体真机仍未跑通，待人 smoke**：`scripts/check.mjs` 只断言**委派请求形状**（`delegateProviderName`、
   注入的 preset/effort/model、合成 `dispatch:<uuid>`、`dispose` 转发一次）与假 ctx 的调用次数；
   `dispatch` 本体的 UI 投影与收尾等价性、`resident`/ownership 事件身份的实际效果，均**未验证**。
-  （`workflow` / `run_workflow` 自带的 per-run 临时 provider 路径已实测：② 的子会话头 `agentPreset: "minimal"`。）
+  （`workflow` 自带的 per-run 临时 provider 路径在旧轮真机（0.5.0 构建）跑通过：② 的子会话头 `agentPreset: "minimal"`；
+  0.6.0 单条披露后的真机形态未验证。）
 - 库存 `subagent` 工具的 route/effort 参数在本机 profile 设置下是否真的开放，取决于 profile 的
   `modelSelectionSettings` + `enabled` + `allowedModels`；本文档只引用源码门控事实，**未**在本机实跑这些参数。
-- **0.2.2-rc.1 只做了静态源码比对，没在本机跑过**：本机装的是 0.2.1-rc.2，§9 的三条结论来自两版源码的
-  逐字节/逐行对比，没有「装到 0.2.2-rc.1 上实跑」的证据。
-- **已实测：真机双通道（0.5.0 同名接管后，2026-11-06）**——`workflow` 与 `run_workflow` 在活宿主上都完成；证据是解
-  `.dsh/sessions/.../session.v4.jsonl.zstd` 后的**子会话头 `agentPreset`**（不是工具回显）：① `workflow(script, meta)`
-  （不传 `preset`）⇒ 子会话 `c64608b7-…` 头 `agentPreset: "cordis"`（继承调用方）；②
+- **§9 的三条结论来自两版源码的逐字节/逐行对比**；本机现在是 0.2.2-rc.1，`scripts/` 两个探针都在该版本实跑过，
+  但它们验证的是**插件行为**，不是「0.2.1-rc.2 上也能跑」。
+- **旧轮真机（0.5.0 构建，2026-11-06）已实测，0.6.0 披露变更后未重跑**——`workflow` 与 `run_workflow` 在活宿主上都
+  完成；证据是解 `.dsh/sessions/.../session.v4.jsonl.zstd` 后的**子会话头 `agentPreset`**（不是工具回显）：
+  ① `workflow(script, meta)`（不传 `preset`）⇒ 子会话 `c64608b7-…` 头 `agentPreset: "cordis"`（继承调用方）；②
   `workflow(script, meta, preset:"minimal", reasoning_effort:"low")` ⇒ 子会话 `f255b1b5-…` 头 `agentPreset: "minimal"`；
   ③ `run_workflow(...)` 更早一轮可用 ⇒ 子会话 `282820af-…` 头 `agentPreset: "cordis"`。三次 run 的 `run-end` 都是
-  `stopReason: completed`。
+  `stopReason: completed`。**注意**：这三次是 0.5.0 构建（两名字都披露）的证据；0.6.0 默认隐藏别名后的真机工具面
+  **未验证**，不能据此宣称「真机单条已测」。
 - **0.5.0 同名接管的其余真机项未验证**（都是假 ctx 探针测不到的）：① UI 工具卡片 / workflow 运行视图是否真能看到
   `workflow/phase` / `workflow/log` / `workflow/agent-start` / `workflow/agent-end` 这批进度；② 真机
   `job_kill` 端到端是否真把引擎 run 取消；③ `systemPrompt` section（order `TOOL_WORKFLOW` = 2600）是否真的
@@ -455,3 +523,37 @@ v0.4.0 的旧做法是 `ctx.tools.guard` 执行期拒绝，现只作兜底，见
   本插件是否已落地这些能力，以 `lib/index.js` / `scripts/check.mjs` 的当前版本为准。
 - **recorder 依赖 `parent.session.append`**：宿主不提供可追加 session 时该 run 不记录（`recorder.start` 返回 `false`，
   不抛错）。这是与库存的**实现差异**，不是「已完全对齐」。
+
+---
+
+## 12. 0.2.2-rc.1 重新核对过的锚点（0.6.0 新增）
+
+0.2.2-rc.1 把若干包重新打包（`dsh-tools/lib/index.js` 现在 665 行，实现与类型在 `lib/shared-*.js` 与 `lib/types/`），
+所以上面各节的**行号在 0.2.2-rc.1 上会漂移**。下表是 2026-11-07 在该版本上逐条 `grep -n` 核对过的锚点，
+用来替代「照抄行号」；`$H` 同上。
+
+| 契约 | 0.2.2-rc.1 位置（`$H/<包>/lib/…`） | 符号 / 原文片段 |
+|---|---|---|
+| 工具视图 own 覆盖 inherited、restriction 只过滤 inherited | `dsh-tools/lib/index.js:477`（`view(scope)`） | `const own = this.layers.peek(scope)` / `for (const layer of layers)` / `if (layers.every((layer) => layer.admits(name)))` / `if (own !== void 0) for (const [name, registration] of own.tools.entries())` |
+| 按作用域读一个工具 | `dsh-tools/lib/index.js:519` | `get(name, scope, toolSet)` → `this.view(scope).visible.get(name)` |
+| 拒绝名单 | `dsh-tools/lib/index.js:453` | `restrict(filter)`（`allow`/`deny`，`run_code` 保留名直接抛错） |
+| 单调拒绝（guard） | `dsh-tools/lib/index.js:649` / `:657` | `guard(guard)` / `checkGuards(exec)`（先全局层、再 `chainLayers(exec.agent)`） |
+| 选择执行器 | `dsh-tools/lib/index.js:608` 附近、方法定义见 `selectExecutor(scope)` | `describe(this.definitions(scope, toolSet))` |
+| 保留名 `run_code` | `dsh-tools/lib/index.js:440` | `if (name === "run_code") throw new Error(... reserved ...)` |
+| 工具定义 / value-schema DSL / schema 投影 | `dsh-tools/lib/index.js:274` / `:310` / `:366` | `parameterSchemaSpecToJsonSchema(spec)` / `defineTool(options)` / `projectToolSchema(definition, detachParameters)` |
+| 作用域链 / 最近者胜合并 / 注册归属 | `dsh-scope/lib/index.js:162` / `:177` / `:189` | `chainLayers(scope)` / `merge(scope, pick)`（global 先、`chainLayers` 由远到近）/ `effect(ctx, action, options)`（`scopeOf(ctx)` 决定归属） |
+| 作用域创建 / 父子绑定 | `dsh-scope/lib/index.js:296` / `:256` / `:276` | `createScope(ctx, key, options)` / `bindScopeParent(key, parent)` / `scopeChainOf(key)` |
+| prompt section 按**调用方作用域**注册 | `dsh-system-prompt/lib/index.js:255` | `section(section)` → `this.layers.effect(this.ctx, …)`（`Service.tracker` 把 `this.ctx` 重绑到访问者） |
+| prompt 组装（按名合并、近者胜） | `dsh-system-prompt/lib/index.js:358` | `async assemble(context = {})` → `this.layers.merge(scope, (layer) => layer.sections)` |
+| `TOOL_WORKFLOW` 排序值 | `dsh-system-prompt/lib/index.js:33` | `TOOL_WORKFLOW: 2600,` |
+| preset 隔离组里的服务读取 | `dsh-agent-preset-registry/lib/index.js:741` | `serviceFor(agent, name) {` |
+| local / external 分流 | `dsh-subagent/lib/index.js:3062` | `return provider.prepareContinuable === void 0 ? manager.startExternal(spec) : manager.startLocal(spec);` |
+| local 路径（preset / agentOptions / schema 挂载） | `dsh-subagent/lib/index.js:1397` | `async startLocal(spec) {` |
+| external 路径 | `dsh-subagent/lib/index.js:1489` | `async startExternal(spec) {` |
+| 能力门控 | `dsh-subagent/lib/index.js:3055` | `this.assertCapabilities(provider, { … })` |
+| 子会话 id 撞车 | `dsh-subagent/lib/index.js:1442` / `:1603` | `DUPLICATE_CHILD` |
+| 库存 workflow：描述 / 后台 job / 取消 / section | `dsh-tool-workflow/lib/index.js:140` / `:224` / `:239` / `:265` | `const DESCRIPTION = \`Run a JavaScript workflow script…` / `jobId: jobs.start({` / `cancel: (reason) => {` / `ctx.systemPrompt.section({` |
+| PTC 执行器：SDK 渲染 / describe | `dsh-tool-executor-ptc/lib/index.js:962` / `:1738` / `:1744` | `renderToolsSdk(schemas, programFormat)` / `describe(_tools)` / `renderSdk(tools)` |
+| 插件兼容性判定（含 prerelease） | `dsh-app-boot/lib/index.js:1095` | `semver.satisfies(runtimeVersion, range, { includePrerelease: true })` |
+
+> 用法：定位契约用上表；**引用行号时带上版本号**（`0.2.2-rc.1`），跨版本一律按符号名 grep。

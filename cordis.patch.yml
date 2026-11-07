@@ -5,18 +5,22 @@
 #   1. the `dispatch_subagent` Host tool — per-call preset / reasoning_effort /
 #      model / provider / cwd / schema, backed by the local provider
 #      `dispatch-local`;
-#   2. the `run_workflow` Host tool — whole-run preset / reasoning_effort /
-#      provider+model / max_total_agents, plus run_in_background. As of 0.5.0
-#      the stock `workflow` tool is TAKEN OVER per agent instead of denied
-#      (同名接管 = same-name takeover ⇒ a real redirect): a
-#      definition from the same `buildWorkflowDefinition` factory (same
-#      `executeWorkflow`) is registered in each agent's OWN scope, so
-#      `workflow` and `run_workflow` are two names for ONE implementation and
-#      a `workflow` call is a real redirect (own layer wins over inherited,
-#      dsh-tools 'view()'). `shadowStockWorkflow` (default true) is the master
-#      switch, `takeoverToolName` (default `workflow`) renames the takeover;
-#      execution-time `tools.guard` survives only as the fallback for an agent
-#      whose own scope already holds somebody else's same-name tool;
+#   2. the model-facing `workflow` capability — ONE name, one disclosure. It
+#      is the stock tool name, taken over PER AGENT (同名接管 ⇒ a real
+#      redirect): a definition from the same `buildWorkflowDefinition` factory
+#      (same `executeWorkflow`, stock COPYRIGHT/description/parameters) is
+#      registered in each agent's OWN scope, so own-over-inherited
+#      (dsh-tools 'view()') makes a `workflow` call run this package, and the
+#      usage-rule prompt section is registered in the same agent scope (same
+#      name ⇒ shadows the preset's copy instead of duplicating it).
+#      `run_workflow` is the compatibility ALIAS: by default it is NOT
+#      registered anywhere (nothing to hide behind), so the model sees exactly
+#      one workflow tool; `exposeRunWorkflow: true` publishes it again, and
+#      `shadowStockWorkflow: false` disables the takeover (no takeover, no
+#      guard, alias published). `takeoverToolName` (default `workflow`)
+#      renames the takeover; execution-time `tools.guard` survives only as the
+#      fallback for an agent whose own scope already holds somebody else's
+#      same-name tool;
 #   3. the external subagent provider `dispatch` — whole-run preset + effort
 #      for workflow agent() / subagentProvider, resolved through
 #      ctx.subagents.startActivation.
@@ -27,7 +31,8 @@
 # shadowStockWorkflow / takeoverToolName / shadowedToolNames straight off the
 # row's config object and falls back to built-in defaults, so a profile can
 # override any of them later (omitting a field just keeps its default) without
-# editing this file. Keep that contract when changing lib/index.js.
+# editing this file. Disclosure knobs: `exposeRunWorkflow` (default false) and
+# `shadowStockWorkflow` (default true). Keep that contract when changing lib/index.js.
 - insert:
     - id: dsh-subagent-dispatch
       name: 'dsh-subagent-dispatch'

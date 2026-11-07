@@ -129,6 +129,12 @@ register(`data:text/javascript,${encodeURIComponent(hookSource)}`, import.meta.u
 const toolsModule = await import('@deepseek-ai/dsh-tools')
 const subagentModule = await import('@deepseek-ai/dsh-subagent')
 const plugin = await import(pathToFileURL(join(packageDir, 'lib', 'index.js')).href)
+// The stock workflow tool AND the PTC executor are the independent oracles:
+// the first is where the model-facing definition/section must come from, the
+// second renders the PTC `tools:sdk` section the model actually programs
+// against. Both are real host modules, never local stand-ins.
+const stockWorkflowModule = await import('@deepseek-ai/dsh-tool-workflow')
+const ptcExecutorModule = await import('@deepseek-ai/dsh-tool-executor-ptc')
 
 /* ------------------------------------------------------------------ *
  * 2. Harness plumbing
@@ -175,6 +181,68 @@ async function rejectsWith(run, pattern, what) {
     throw new Error(`${what}: rejection message did not match ${pattern}: ${messageOf(thrown)}`)
   }
   return thrown
+}
+
+/** Key-order-insensitive deep equality, so assertions never depend on object insertion order. */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+/**
+ * Capture the STOCK `workflow` definition and prompt section by running the
+ * stock module's own `apply()` against a minimal fake context. This is the
+ * independent oracle for the "same shape as the original" requirement: no
+ * description, parameter or section text is ever copied into this script.
+ *
+ * `Config({})` is passed deliberately: the stock `apply()` reads its config
+ * without defaults (plan OI4), so an empty object would capture
+ * `toolName: undefined` and produce a garbage baseline.
+ */
+let stockWorkflowBaselineCache
+async function stockWorkflowBaseline() {
+  if (stockWorkflowBaselineCache !== undefined) return stockWorkflowBaselineCache
+  const definitions = []
+  const sections = []
+  const fakeCtx = {
+    systemPrompt: {
+      section: (definition) => {
+        sections.push(definition)
+        return () => {}
+      },
+      getSectionOrder: () => 2600,
+    },
+    tools: {
+      register: (definition) => {
+        definitions.push(definition)
+        return () => {}
+      },
+    },
+    on: () => () => {},
+    get: () => undefined,
+    effect: (factory) => {
+      factory()
+      return () => {}
+    },
+    logger: { info: () => {}, warn: () => {} },
+  }
+  stockWorkflowModule.apply(fakeCtx, stockWorkflowModule.Config({}))
+  if (definitions.length !== 1) throw new Error(`stock workflow registered ${definitions.length} definitions, expected 1`)
+  if (sections.length !== 1) throw new Error(`stock workflow registered ${sections.length} sections, expected 1`)
+  const definition = definitions[0]
+  const section = sections[0]
+  if (definition.name !== TAKEOVER_STOCK_NAME) {
+    throw new Error(`stock workflow name is ${String(definition.name)}, expected ${TAKEOVER_STOCK_NAME}`)
+  }
+  if (section.name !== `tool:${TAKEOVER_STOCK_NAME}`) {
+    throw new Error(`stock workflow section name is ${String(section.name)}, expected tool:${TAKEOVER_STOCK_NAME}`)
+  }
+  stockWorkflowBaselineCache = { definition, section }
+  return stockWorkflowBaselineCache
 }
 
 /* Fake LLM runtime: the same `reasoning.efforts` metadata shape the host returns. */
@@ -497,6 +565,11 @@ function mount(config = {}, options = {}) {
     // and `parent.session.append`.
     guards: [],
     sections: [],
+    // ONE OWN prompt-section table per agent, mirroring the host's scoped
+    // `systemPrompt.section()` layers (`dsh-scope` `ScopedLayers.effect`):
+    // a scoped entry with the same NAME shadows the global/preset one instead
+    // of duplicating it (`merge()` = global first, nearest scope last).
+    agentSections: new Map(),
     sectionOrderNames: [],
     listeners: new Map(),
     warnings: [],
@@ -627,6 +700,7 @@ function mount(config = {}, options = {}) {
   ctx.get = (serviceName) => {
     if (serviceName === 'workflowEngine') return engineMode === 'none' ? state.mountedEngine : engine
     if (serviceName === 'ptcRuntime') return options.ptcRuntime
+    if (serviceName === 'loader') return options.loader
     if (serviceName === 'agentPresets') return agentPresets
     if (serviceName === 'jobs') return options.jobs === 'none' ? undefined : jobs
     // `agents.list()` is the takeover's source for agents that already existed
@@ -648,7 +722,12 @@ function mount(config = {}, options = {}) {
     state.mountedEngine = options.mountedEngine ?? engine
     return { dispose() {} }
   }
-  plugin.apply(ctx, config)
+  // LEGACY DEFAULT for the harness only: most cases drive the alias
+  // implementation directly through the global `run_workflow` registration,
+  // which production hides while the takeover is active (single disclosure).
+  // A case opts into the production default with `{ exposeRunWorkflow:
+  // undefined }`; `{ exposeRunWorkflow: true }` restores the alias explicitly.
+  plugin.apply(ctx, { exposeRunWorkflow: true, ...config })
   return { ctx, state, parent, engine, jobs, emit }
 }
 
@@ -666,9 +745,49 @@ function mount(config = {}, options = {}) {
  */
 function layeredToolGet(state, toolName, scope) {
   if (scope === undefined) return state.tools.get(toolName)
+  // A restriction filters the inherited face (`dsh-tools/lib/index.js:3041`),
+  // so a denied name must read back `undefined` even though the layer holds it.
+  const denied = new Set(scope?.viewOptions?.denied ?? [])
+  if (denied.has(toolName)) return undefined
   const own = state.agentOwn.get(scope)
   if (own !== undefined && own.has(toolName)) return own.get(toolName)
   return state.tools.get(toolName) ?? state.stockTools.get(toolName)
+}
+
+/**
+ * The layered view behind `tools.view(scope)` — host contract
+ * (`dsh-tools/lib/index.js:485-505`): a `visible` map (own layer over
+ * inherited, minus restrictions) plus the PRE-restriction `knownNames` set.
+ * That second field is what separates "this agent never had `workflow`" from
+ * "`restrict({ deny: ['workflow'] })` filtered it": in the latter the name is
+ * still known. `run_code` is the PTC executor's own transport and never sits
+ * in the registry, so a case models it with `viewOptions.runCode`.
+ */
+function layeredToolView(state, scope) {
+  const own = state.agentOwn.get(scope)
+  const options = scope?.viewOptions ?? {}
+  const denied = new Set(options.denied ?? [])
+  const visible = new Map()
+  const knownNames = new Set()
+  for (const [name, definition] of state.tools) {
+    knownNames.add(name)
+    if (!denied.has(name)) visible.set(name, definition)
+  }
+  for (const [name, definition] of state.stockTools) {
+    knownNames.add(name)
+    if (!denied.has(name)) visible.set(name, definition)
+  }
+  if (own !== undefined) {
+    for (const [name, definition] of own) {
+      knownNames.add(name)
+      visible.set(name, definition)
+    }
+  }
+  if (options.runCode === true) {
+    knownNames.add('run_code')
+    visible.set('run_code', { name: 'run_code', ptcTransport: true })
+  }
+  return { visible, knownNames }
 }
 
 /**
@@ -684,8 +803,11 @@ function layeredToolGet(state, toolName, scope) {
  * how a case models "somebody else already holds this name here" and "an
  * earlier plugin instance left its definition behind".
  */
-function makeFakeAgent(state, id, ownTools = []) {
+function makeFakeAgent(state, id, ownTools = [], viewOptions = {}) {
   const agent = { id }
+  // What this agent's `view(scope)` reports: `runCode` models the PTC
+  // transport; `denied` models a `restrict({ deny: [...] })` filter.
+  agent.viewOptions = viewOptions
   const own = new Map()
   for (const [toolName, definition] of ownTools) own.set(toolName, definition)
   state.agentOwn.set(agent, own)
@@ -717,11 +839,29 @@ function makeFakeAgent(state, id, ownTools = []) {
       return () => {}
     },
     get: (toolName, scope) => layeredToolGet(state, toolName, scope),
+    // `view(scope)` is the read the bounded PTC supplement uses to tell a
+    // missing capability from a filtered one (`dsh-tools/lib/index.js:470-506`).
+    view: (scope) => layeredToolView(state, scope ?? agent),
+  }
+  const scopedSections = new Map()
+  state.agentSections.set(agent, scopedSections)
+  const scopedPrompt = {
+    // Same-scope duplicate names throw in the host (`NamedEntries`); an
+    // ancestor's same-name section is NOT a duplicate — the nearer one wins
+    // (`dsh-scope` `merge`).
+    section(definition) {
+      if (scopedSections.has(definition.name)) {
+        throw new Error(`prompt section "${definition.name}" is already registered in this scope`)
+      }
+      scopedSections.set(definition.name, definition)
+      return () => scopedSections.delete(definition.name)
+    },
+    getSectionOrder: () => 2600,
   }
   agent.ctx = {
     inject(_paths, callback) {
       const invoke = () => Promise.resolve()
-        .then(() => callback({ tools: scopedTools }))
+        .then(() => callback({ tools: scopedTools, systemPrompt: scopedPrompt }))
         .then(() => fiber)
       return {
         then: (resolveInjected, rejectInjected) => invoke().then(resolveInjected, rejectInjected),
@@ -730,6 +870,18 @@ function makeFakeAgent(state, id, ownTools = []) {
     },
   }
   return agent
+}
+
+/**
+ * The prompt sections an agent actually assembles: the GLOBAL/preset layer
+ * (modelled by `state.sections`) merged with that agent's OWN layer, nearest
+ * scope winning a duplicate name — the host's `ScopedLayers.merge` order.
+ */
+function effectiveSections(state, agent) {
+  const merged = new Map(state.sections.map((section) => [section.name, section]))
+  const own = state.agentSections.get(agent)
+  if (own !== undefined) for (const [name, section] of own) merged.set(name, section)
+  return [...merged.values()]
 }
 
 /** Fire one agent-lifecycle event; returns the handlers' values, unawaited. */
@@ -1236,7 +1388,10 @@ const WF_TOOL_NAME = 'run_workflow'
 // else in this case changed.
 const WF_PARAMETERS = ['args', 'max_total_agents', 'meta', 'model', 'preset', 'provider', 'reasoning_effort', 'run_in_background', 'script']
 const WF_SCRIPT = "const child = await agent('do it', { label: 'probe' }); return { child }"
-const WF_META = { name: 'probe-workflow' }
+// The stock `meta` object requires BOTH `name` and `description`
+// (`dsh-tool-workflow/lib/index.js:279-294`), and the plugin keeps that schema
+// verbatim, so every fixture carries both.
+const WF_META = { name: 'probe-workflow', description: 'Probe workflow used by the self-check.' }
 const TEMP_PREFIX_STATE = (state) => state.registerCalls.filter((name) => name !== 'dispatch' && name !== 'dispatch-local')
 
 await probe('WF_TOOL_SCHEMA', async () => {
@@ -1253,7 +1408,10 @@ await probe('WF_TOOL_SCHEMA', async () => {
     throw new Error(`${WF_TOOL_NAME} root required is ${JSON.stringify(tool.parameters.required)}, expected script+meta only`)
   }
   for (const [name, node] of Object.entries(tool.parameters.properties)) {
-    if (Object.hasOwn(node, 'required')) throw new Error(`parameter ${name} kept a per-property required flag in the compiled schema`)
+    // The compiled schema may legitimately carry a nested `required` ARRAY on
+    // an object parameter (stock `meta` does); only the authoring shorthand —
+    // a boolean `required: true` left on the property node — is forbidden.
+    if (node.required === true) throw new Error(`parameter ${name} kept a per-property required flag in the compiled schema`)
   }
   if (tool.parameters.properties.script.type !== 'string') throw new Error(`script.type is ${String(tool.parameters.properties.script.type)}`)
   if (tool.parameters.properties.meta.type !== 'object') throw new Error(`meta.type is ${String(tool.parameters.properties.meta.type)}`)
@@ -1300,6 +1458,43 @@ await probe('WF_PTC_ENGINE_MOUNT', async () => {
   if (state.engine.calls.length !== 1) throw new Error(`engine.start called ${state.engine.calls.length} times, expected 1`)
   if (value.runId !== state.engine.runs[0].runId) throw new Error('the run id did not come from the mounted engine')
   return 'no preset engine + ts PTC runtime -> official engine mounted once, run completed'
+})
+
+await probe('WF_PTC_ENGINE_LOADER', async () => {
+  const loaderCalls = []
+  function FakeEngine() {}
+  const { state, parent } = mount({}, {
+    engine: 'none',
+    ptcRuntime: { language: 'typescript' },
+    loader: {
+      import: async (name) => {
+        loaderCalls.push(name)
+        return { default: FakeEngine }
+      },
+    },
+  })
+  const tool = state.tools.get(WF_TOOL_NAME)
+  await tool.execute({ script: WF_SCRIPT, meta: WF_META }, execFor(parent))
+  if (loaderCalls.length !== 1 || loaderCalls[0] !== '@deepseek-ai/dsh-workflow-ptc') {
+    throw new Error(`loader.import saw ${JSON.stringify(loaderCalls)}, expected the engine package once`)
+  }
+  if (state.pluginMounts.length !== 1) throw new Error('the engine was not mounted through the loader module')
+  if (state.pluginMounts[0].Engine !== FakeEngine) throw new Error('the mounted class came from somewhere else')
+  if (state.engine.calls.length !== 1) throw new Error('the workflow did not run after the loader mount')
+  return 'loader.import routed the engine package; mounted once; run completed'
+})
+
+await probe('WF_PTC_ENGINE_LOADER_FALLBACK', async () => {
+  const { state, parent } = mount({}, {
+    engine: 'none',
+    ptcRuntime: { language: 'typescript' },
+    loader: { import: async () => { throw new Error('synthetic loader miss') } },
+  })
+  const tool = state.tools.get(WF_TOOL_NAME)
+  await tool.execute({ script: WF_SCRIPT, meta: WF_META }, execFor(parent))
+  if (state.pluginMounts.length !== 1) throw new Error('a loader miss must fall back to the bare import, not abort the mount')
+  if (!state.warnings.some((line) => /synthetic loader miss/.test(line))) throw new Error('the loader miss was not warned')
+  return 'loader miss warned, bare import used, engine mounted once'
 })
 
 await probe('WF_PTC_ENGINE_CACHED', async () => {
@@ -2138,6 +2333,30 @@ await probe('TAKEOVER_FALLBACK_GUARD', async () => {
   return 'foreign same-name → no throw, warn, one per-agent denial pointing at run_workflow, 0 global guards'
 })
 
+await probe('TAKEOVER_FOREIGN_KEPT', async () => {
+  // Production default (single disclosure): the alias is NOT published, so a
+  // denial would point at nothing. A takeover that cannot land must not take
+  // anything away — the foreign definition keeps serving the name and NO guard
+  // is installed for it.
+  const { state } = mount({ exposeRunWorkflow: undefined })
+  const foreign = { name: TAKEOVER_STOCK_NAME, foreign: true }
+  const agent = makeFakeAgent(state, 'agent-foreign-kept', [[TAKEOVER_STOCK_NAME, foreign]])
+  await announceAgent(state, agent)
+  if (agentGuardsOf(state, agent).length !== 0) {
+    throw new Error('a per-agent guard was registered although no alias exists to redirect to')
+  }
+  if (agentOwnOf(state, agent).get(TAKEOVER_STOCK_NAME) !== foreign) {
+    throw new Error('the foreign definition was replaced or removed instead of left in place')
+  }
+  if (layeredToolGet(state, TAKEOVER_STOCK_NAME, agent) !== foreign) {
+    throw new Error('the agent no longer resolves the foreign definition — the capability was lost')
+  }
+  if (!state.warnings.some((warning) => /could not take over/i.test(warning))) {
+    throw new Error(`the failed takeover produced no warning: ${state.warnings.join(' | ')}`)
+  }
+  return 'alias hidden + foreign owner → capability preserved, 0 guards, one warning'
+})
+
 await probe('TAKEOVER_DISABLED', async () => {
   const { state } = mount({ shadowStockWorkflow: false })
   if ((state.listeners.get('agent/created') ?? []).length !== 0) {
@@ -2226,30 +2445,352 @@ await probe('TAKEOVER_ADOPT_OWN', async () => {
   return 'marker matched → adopted: 0 registrations, 0 guards, one stale-executeWorkflow warning'
 })
 
+await probe('WF_STOCK_DEFINITION_PARITY', async () => {
+  // Criterion 2 — "same shape as the stock definition". The oracle is a
+  // runtime capture of the REAL `@deepseek-ai/dsh-tool-workflow` apply(); no
+  // description, parameter or required list is copied into this file.
+  const stock = await stockWorkflowBaseline()
+  const { state } = mount({ exposeRunWorkflow: true })
+  const tool = state.tools.get(WF_TOOL_NAME)
+  if (tool === undefined) throw new Error(`the ${WF_TOOL_NAME} definition was not registered`)
+  if (tool.description !== stock.definition.description) {
+    throw new Error(`description differs from the stock DESCRIPTION`
+      + ` (${String(tool.description).length} vs ${stock.definition.description.length} chars)`)
+  }
+  const stockParameters = stock.definition.parameters.properties
+  const pluginParameters = tool.parameters.properties
+  if (JSON.stringify([...(stock.definition.parameters.required ?? [])].sort()) !== JSON.stringify(['meta', 'script'])) {
+    throw new Error(`the stock oracle's required list is ${JSON.stringify(stock.definition.parameters.required)}, expected script+meta`
+      + ' (the capture itself is wrong)')
+  }
+  if (canonicalJson(pluginParameters.meta) !== canonicalJson(stockParameters.meta)) {
+    throw new Error('meta parameter is not structurally identical to the stock one (properties/required/additionalProperties)')
+  }
+  for (const stockName of Object.keys(stockParameters)) {
+    if (canonicalJson(pluginParameters[stockName]) !== canonicalJson(stockParameters[stockName])) {
+      throw new Error(`stock parameter "${stockName}" differs from the stock definition`)
+    }
+  }
+  const stockRequired = [...(stock.definition.parameters.required ?? [])].sort()
+  const pluginRequired = [...(tool.parameters.required ?? [])].sort()
+  if (JSON.stringify(pluginRequired) !== JSON.stringify(stockRequired)) {
+    throw new Error(`root required is ${JSON.stringify(pluginRequired)}, expected the stock ${JSON.stringify(stockRequired)}`)
+  }
+  const additions = Object.keys(pluginParameters).filter((name) => !Object.hasOwn(stockParameters, name)).sort()
+  const expectedAdditions = ['max_total_agents', 'model', 'preset', 'provider', 'reasoning_effort']
+  if (JSON.stringify(additions) !== JSON.stringify(expectedAdditions)) {
+    throw new Error(`added parameters are ${additions.join(',')}, expected exactly ${expectedAdditions.join(',')}`)
+  }
+  for (const name of additions) {
+    if (pluginParameters[name].required === true) {
+      throw new Error(`plugin addition "${name}" is required; every plugin per-run knob must stay optional`)
+    }
+  }
+  if (typeof stock.definition.description !== 'string' || stock.definition.description.length < 1000) {
+    throw new Error('the stock oracle captured no real description')
+  }
+})
+
+await probe('WF_ALIAS_HIDDEN', async () => {
+  // Criterion 1/5 — production default: the takeover serves the capability, the
+  // global alias is NOT published, so any workflow-shaped name set is exactly
+  // ['workflow'].
+  const { state } = mount({ exposeRunWorkflow: undefined })
+  if (state.tools.has(WF_TOOL_NAME)) {
+    throw new Error(`${WF_TOOL_NAME} is still published globally although the takeover is active`)
+  }
+  if ((state.listeners.get('agent/created') ?? []).length === 0) {
+    throw new Error('no agent/created listener — the takeover would be inactive and this case vacuous')
+  }
+  const agent = makeFakeAgent(state, 'agent-alias-hidden')
+  await announceAgent(state, agent)
+  const own = agentOwnOf(state, agent)
+  if (own.size !== 1 || !own.has(TAKEOVER_STOCK_NAME)) {
+    throw new Error(`the agent's OWN layer is [${[...own.keys()].join(',')}], expected exactly [workflow]`)
+  }
+  const registrations = state.agentRegisters.filter((entry) => entry.agent === agent)
+  if (registrations.length !== 1 || registrations[0].name !== TAKEOVER_STOCK_NAME) {
+    throw new Error(`registrations are ${registrations.map((entry) => entry.name).join(',')}, expected exactly one workflow`)
+  }
+  const workflowNames = [...layeredToolView(state, agent).visible.keys()]
+    .filter((name) => name.includes('workflow'))
+    .sort()
+  if (JSON.stringify(workflowNames) !== JSON.stringify(['workflow'])) {
+    throw new Error(`the agent's workflow-capability names are ${JSON.stringify(workflowNames)}, expected ["workflow"]`)
+  }
+})
+
+await probe('WF_ALIAS_SWITCH', async () => {
+  // Criterion 5 — the alias is still registered and can be re-exposed by config.
+  const exposed = mount({ exposeRunWorkflow: true })
+  if (!exposed.state.tools.has(WF_TOOL_NAME)) {
+    throw new Error(`exposeRunWorkflow: true did not publish ${WF_TOOL_NAME}`)
+  }
+  if ((exposed.state.listeners.get('agent/created') ?? []).length === 0) {
+    throw new Error('exposeRunWorkflow: true disabled the takeover too; it must only restore the alias')
+  }
+  const compat = mount({ shadowStockWorkflow: false })
+  if (!compat.state.tools.has(WF_TOOL_NAME)) {
+    throw new Error(`shadowStockWorkflow: false did not restore ${WF_TOOL_NAME}`)
+  }
+  if ((compat.state.listeners.get('agent/created') ?? []).length !== 0) {
+    throw new Error('shadowStockWorkflow: false still subscribed to agent creation (it is the master switch)')
+  }
+  if (compat.state.guards.length !== 0) throw new Error('shadowStockWorkflow: false registered a global guard')
+})
+
+await probe('WF_SECTION_STOCK_ONCE', async () => {
+  // Criterion 4 — one section, stock text verbatim, no implementation leak.
+  // The assertion reads the CAPTURED runtime objects, never a source slice, so
+  // comments that mention the takeover cannot fail it.
+  const stock = await stockWorkflowBaseline()
+  const { state } = mount()
+  const agent = makeFakeAgent(state, 'agent-section-once')
+  await announceAgent(state, agent)
+  const sections = effectiveSections(state, agent)
+  if (sections.length !== 1) {
+    throw new Error(`${sections.length} prompt sections assembled, expected exactly 1`)
+  }
+  const section = sections[0]
+  if (section.text !== stock.section.text) {
+    throw new Error(`section text is not the stock text verbatim\nplugin: ${String(section.text)}\nstock:  ${stock.section.text}`)
+  }
+  const forbidden = /takeover|executeworkflow|two names|run_workflow/i
+  if (forbidden.test(section.text)) {
+    throw new Error(`the section text leaks the takeover implementation: ${section.text}`)
+  }
+  if (section.name !== 'tool:workflow') {
+    throw new Error(`section.name is ${String(section.name)}, expected tool:workflow`)
+  }
+  if (section.order !== 2600) {
+    throw new Error(`section.order is ${String(section.order)}, expected the TOOL_WORKFLOW order 2600`)
+  }
+})
+
+await probe('WF_SECTION_SHADOWS_STOCK', async () => {
+  // Criterion 4 in the STANDARD/CORDIS shape: the stock tool is mounted in a
+  // preset (ancestor) scope and registered its own `tool:workflow` section
+  // there, but with DIFFERENT text (a host whose stock section was customised).
+  // The agent-scope section must SHADOW it — exactly one section assembles, and
+  // it is ours (the stock usage rule), never both — and the stock's own
+  // registration must never be disturbed.
+  const stock = await stockWorkflowBaseline()
+  const { state } = mount()
+  state.sections.push({ name: 'tool:workflow', order: 2600, text: 'Stock section from the preset scope (customised).' })
+  const agent = makeFakeAgent(state, 'agent-section-shadow')
+  await announceAgent(state, agent)
+  const sections = effectiveSections(state, agent)
+  if (sections.length !== 1) {
+    throw new Error(`${sections.length} assembled sections, expected the agent's one to shadow the preset's`)
+  }
+  if (sections[0].text !== stock.section.text) {
+    throw new Error(`the preset section was not shadowed: ${String(sections[0].text)}`)
+  }
+  if (state.sections.length !== 1 || state.sections[0].text !== 'Stock section from the preset scope (customised).') {
+    throw new Error('the preset layer section was mutated — a scoped shadow must leave the ancestor untouched')
+  }
+})
+
+await probe('WF_RESTRICT_NO_GRANT', async () => {
+  // Criterion 6 — a `restrict({ deny: ['workflow'] })` agent is never force-fed:
+  // the name is KNOWN (pre-restriction) but not visible, and a denial is not an
+  // absence. Zero registrations, zero guards.
+  const { state } = mount({ exposeRunWorkflow: undefined })
+  const agent = makeFakeAgent(state, 'agent-restricted', [], { runCode: true, denied: [TAKEOVER_STOCK_NAME] })
+  await announceAgent(state, agent)
+  const view = layeredToolView(state, agent)
+  if (!view.knownNames.has(TAKEOVER_STOCK_NAME) || view.visible.has(TAKEOVER_STOCK_NAME)) {
+    throw new Error('the fixture is wrong: workflow must be known-but-denied for this agent')
+  }
+  if (agentOwnOf(state, agent).size !== 0) {
+    throw new Error(`the restricted agent received ${agentOwnOf(state, agent).size} definition(s) in its OWN layer`)
+  }
+  if (state.agentRegisters.filter((entry) => entry.agent === agent).length !== 0) {
+    throw new Error('the restricted agent received a registration')
+  }
+  if (agentGuardsOf(state, agent).length !== 0) throw new Error('the restricted agent received a guard')
+})
+
+await probe('WF_PTC_SUPPLEMENT', async () => {
+  // Criterion 3 (unit half) — a PTC agent (run_code visible, workflow never
+  // existed) gets EXACTLY one workflow binding, rendered once in the real PTC
+  // `tools:sdk` section, and the binding is callable.
+  const { state } = mount({ exposeRunWorkflow: undefined }, { stockTools: new Map() })
+  const agent = makeFakeAgent(state, 'agent-ptc', [], { runCode: true })
+  await announceAgent(state, agent)
+  const own = agentOwnOf(state, agent)
+  if (own.size !== 1 || !own.has(TAKEOVER_STOCK_NAME)) {
+    throw new Error(`the PTC agent's OWN layer is [${[...own.keys()].join(',')}], expected exactly [workflow]`)
+  }
+  if (state.tools.has(WF_TOOL_NAME)) throw new Error(`the global ${WF_TOOL_NAME} alias must stay hidden`)
+  const view = layeredToolView(state, agent)
+  const capabilityNames = [...view.visible.keys()]
+  if (capabilityNames.filter((name) => name.includes('workflow')).length !== 1) {
+    throw new Error(`decided workflow capabilities are ${JSON.stringify(capabilityNames)}, expected exactly one workflow`)
+  }
+  if (capabilityNames.includes(WF_TOOL_NAME)) throw new Error(`the ${WF_TOOL_NAME} alias leaked into the PTC view`)
+  if (!view.visible.has('run_code')) throw new Error('the PTC view lost its run_code transport')
+  // The real PTC renderer is the oracle for "exactly one line in tools:sdk".
+  const sdkSchemas = [...view.visible.entries()]
+    .filter(([name]) => name !== 'run_code')
+    .map(([, definition]) => ({
+      name: definition.name,
+      description: definition.description,
+      parameters: definition.parameters,
+      output: definition.output.schema,
+    }))
+  const sdk = ptcExecutorModule.renderToolsSdk(sdkSchemas)
+  // `renderToolsSdk` emits EACH tool twice (once in `ToolArgsMap`, once in
+  // `ToolOutputMap`), so count bindings in the arguments interface only.
+  const argsInterface = sdk.slice(sdk.indexOf('interface ToolArgsMap {'), sdk.indexOf('interface ToolOutputMap {'))
+  if (argsInterface === '') throw new Error('the PTC tools:sdk section has no ToolArgsMap interface')
+  const bindings = argsInterface.split('\n').filter((line) => /^\s{2}workflow: /.test(line)).length
+  if (bindings !== 1) {
+    throw new Error(`the PTC tools:sdk declares ${bindings} workflow bindings, expected exactly 1\n${sdk.slice(0, 400)}`)
+  }
+  if (sdk.includes(WF_TOOL_NAME)) throw new Error(`the ${WF_TOOL_NAME} alias appears in the PTC tools:sdk`)
+  // Callable: the supplemented definition is a real tool.
+  const definition = own.get(TAKEOVER_STOCK_NAME)
+  const value = await definition.execute(
+    { script: 'return 42', meta: { name: 'ptc-probe', description: 'PTC supplement probe' } },
+    execFor(agent),
+  )
+  if (value?.kind !== 'foreground' || typeof value.runId !== 'string') {
+    throw new Error(`the supplemented definition did not run: ${JSON.stringify(value)}`)
+  }
+})
+
 await probe('WF_SYSTEM_PROMPT_SECTION', async () => {
   const { state } = mount()
-  if (state.sections.length !== 1) throw new Error(`${state.sections.length} prompt sections registered, expected 1`)
-  const section = state.sections[0]
+  // Placement contract: with the takeover active the rule belongs to the AGENT
+  // (own scope), not to the global layer — a global copy would race the stock
+  // preset's own `tool:workflow` section and, if both landed in one scope,
+  // duplicate-name-throw. Nothing global is registered by this plugin.
+  if (state.sections.length !== 0) {
+    throw new Error(`${state.sections.length} GLOBAL prompt section(s) registered, expected 0 with the takeover active`)
+  }
+  const agent = makeFakeAgent(state, 'agent-section')
+  await announceAgent(state, agent)
+  const sections = effectiveSections(state, agent)
+  if (sections.length !== 1) throw new Error(`${sections.length} effective sections for the agent, expected 1`)
+  const section = sections[0]
   if (section.order !== 2600) {
     throw new Error(`section.order is ${String(section.order)}, expected the TOOL_WORKFLOW order 2600`)
   }
   if (!state.sectionOrderNames.includes('TOOL_WORKFLOW')) {
     throw new Error(`getSectionOrder was asked for ${state.sectionOrderNames.join(',')}, expected TOOL_WORKFLOW`)
   }
-  if (typeof section.name !== 'string' || !section.name.includes(WF_TOOL_NAME)) {
-    throw new Error(`section.name is ${String(section.name)}, expected it to name ${WF_TOOL_NAME}`)
+  if (section.name !== `tool:${TAKEOVER_STOCK_NAME}`) {
+    throw new Error(`section.name is ${String(section.name)}, expected the model-facing name tool:${TAKEOVER_STOCK_NAME}`)
   }
-  if (typeof section.text !== 'string' || !section.text.includes(WF_TOOL_NAME)) {
-    throw new Error('the section text must tell the model to use run_workflow')
+  if (typeof section.text !== 'string' || !section.text.startsWith(`Use the ${TAKEOVER_STOCK_NAME} tool ONLY when`)) {
+    throw new Error(`the section text does not carry the stock usage rule: ${String(section.text)}`)
   }
-  return 'section order=2600 (TOOL_WORKFLOW), text points at run_workflow'
+  return 'per-agent section: order=2600, name tool:workflow, stock usage rule, 0 global sections'
+})
+
+await probe('WF_GLOSSARY_NO_DEAD_NAMES', async () => {
+  // Single disclosure means no model-visible string may name `run_workflow`.
+  // Three surfaces are checked here, all reachable in production defaults:
+  //  (a) the global shadow guard's denial text,
+  //  (b) the deny-list filter (own tools + the stock name can never be denied),
+  //  (c) an engine-less call made through the taken-over name.
+  const guarded = mount({ exposeRunWorkflow: undefined, ...{ shadowedToolNames: ['some-stock'] } })
+  if (guarded.state.guards.length !== 1) {
+    throw new Error(`${guarded.state.guards.length} global guards registered, expected 1 for shadowedToolNames`)
+  }
+  const denial = guarded.state.guards[0]({ name: 'some-stock' })
+  if (typeof denial !== 'string' || denial.length === 0) throw new Error('the guard returned no reason')
+  if (denial.includes(WF_TOOL_NAME)) {
+    throw new Error(`the denial points at the unpublished alias: ${denial}`)
+  }
+  if (!denial.includes(TAKEOVER_STOCK_NAME)) {
+    throw new Error(`the denial does not point at the model-facing name: ${denial}`)
+  }
+
+  // A custom takeover name must not push the stock name or this package's own
+  // tools into the deny list: a guard can deny, never allow, so one stray entry
+  // would delete a working capability.
+  const renamed = mount({
+    takeoverToolName: 'myflow',
+    shadowedToolNames: [TAKEOVER_STOCK_NAME, WF_TOOL_NAME, 'dispatch_subagent', 'some-stock'],
+  })
+  if (renamed.state.guards.length !== 1) {
+    throw new Error(`${renamed.state.guards.length} guards, expected 1`)
+  }
+  const renamedGuard = renamed.state.guards[0]
+  for (const name of [TAKEOVER_STOCK_NAME, WF_TOOL_NAME, 'dispatch_subagent']) {
+    if (renamedGuard({ name }) !== undefined) throw new Error(`the guard denies "${name}", which must always be allowed`)
+  }
+  if (renamedGuard({ name: 'some-stock' }) === undefined) throw new Error('the guard stopped denying an explicitly listed name')
+
+  // Engine-less call through the taken-over name: the error must name the tool
+  // the model called, never the hidden alias.
+  const engineLess = mount({}, { engine: 'none' })
+  const agent = makeFakeAgent(engineLess.state, 'agent-engine-less')
+  await announceAgent(engineLess.state, agent)
+  const takeover = agentOwnOf(engineLess.state, agent).get(TAKEOVER_STOCK_NAME)
+  if (takeover === undefined) throw new Error('no takeover definition to call')
+  let message = ''
+  try {
+    await takeover.execute(
+      { script: 'return 1', meta: { name: 'probe', description: 'probe' } },
+      { agent, name: TAKEOVER_STOCK_NAME, signal: new AbortController().signal },
+    )
+  } catch (error) {
+    message = messageOf(error)
+  }
+  if (!message.startsWith(`${TAKEOVER_STOCK_NAME}: `)) {
+    throw new Error(`the engine-less error does not name the called tool: ${message}`)
+  }
+  if (message.includes(WF_TOOL_NAME)) {
+    throw new Error(`the engine-less error leaks the hidden alias: ${message}`)
+  }
+})
+
+await probe('WF_ERROR_NAMES_CALLED_TOOL', async () => {
+  // 0.6.0 — nothing the model sees may name a tool it cannot call. Model-facing
+  // errors are prefixed with the name the CALLER used, never the hidden alias.
+  const { state } = mount({ exposeRunWorkflow: true })
+  const agent = makeFakeAgent(state, 'agent-error-names')
+  await announceAgent(state, agent)
+  const takeover = agentOwnOf(state, agent).get(TAKEOVER_STOCK_NAME)
+  const alias = state.tools.get(WF_TOOL_NAME)
+  if (takeover === undefined || alias === undefined) throw new Error('fixture incomplete: missing a definition')
+  const errorOf = async (definition, name) => {
+    try {
+      // No `agent` on the exec: the shared implementation rejects before it
+      // touches the engine, so the message is the only observable.
+      await definition.execute({ script: 'return 1', meta: { name: 'probe', description: 'probe' } }, { name })
+    } catch (error) {
+      return messageOf(error)
+    }
+    return ''
+  }
+  const takeoverMessage = await errorOf(takeover, TAKEOVER_STOCK_NAME)
+  const aliasMessage = await errorOf(alias, WF_TOOL_NAME)
+  if (!takeoverMessage.startsWith(`${TAKEOVER_STOCK_NAME}: `)) {
+    throw new Error(`the takeover error names the wrong tool: ${takeoverMessage}`)
+  }
+  if (!aliasMessage.startsWith(`${WF_TOOL_NAME}: `)) {
+    throw new Error(`the alias error names the wrong tool: ${aliasMessage}`)
+  }
+  if (takeoverMessage.includes(WF_TOOL_NAME)) {
+    throw new Error(`the takeover error leaks the hidden alias name: ${takeoverMessage}`)
+  }
 })
 
 await probe('PEER_RANGE_PRE_RELEASE', async () => {
   const pkg = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'))
   const peers = pkg.peerDependencies ?? {}
   const peerNames = Object.keys(peers)
-  if (peerNames.length !== 5) throw new Error(`expected 5 peerDependencies, saw ${peerNames.length} (${peerNames.join(',')})`)
+  // 6 since 0.6.0: `systemPrompt` is a REQUIRED injection (the array form of
+  // `export const inject` is required, cordis `Inject.resolve`), so the peer
+  // set must name the package that provides it.
+  if (peerNames.length !== 6) throw new Error(`expected 6 peerDependencies, saw ${peerNames.length} (${peerNames.join(',')})`)
+  if (!peerNames.includes('@deepseek-ai/dsh-system-prompt')) {
+    throw new Error('peerDependencies does not declare @deepseek-ai/dsh-system-prompt although `inject` requires it')
+  }
   const expectedRange = '>=0.2.1-rc.2 <0.3.0 || >=0.2.2-rc.1 <0.3.0'
   for (const peerName of peerNames) {
     if (peers[peerName] !== expectedRange) {
@@ -2273,7 +2814,7 @@ await probe('PEER_RANGE_PRE_RELEASE', async () => {
       }
     }
   }
-  return '0.2.1-rc.2 ✅ 0.2.2-rc.1 ✅ 0.2.0 ❌ 0.2.3 ✅ 0.3.0 ❌ across 5 peers (local semver)'
+  return `0.2.1-rc.2 ✅ 0.2.2-rc.1 ✅ 0.2.0 ❌ 0.2.3 ✅ 0.3.0 ❌ across ${peerNames.length} peers (local semver)`
 })
 
 /* ------------------------------------------------------------------ *
