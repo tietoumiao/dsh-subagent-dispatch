@@ -461,7 +461,7 @@ PTC 预设自身已启用库存 `workflow` 的组合（OI2）在单元层按「�
 
 | 项 | 档位 | 证据 / 原因 |
 |---|---|---|
-| 68 例自检全绿 | **已实测** | `DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 68 passed` / `result: OK`（exit 0） |
+| 69 例自检全绿 | **已实测** | `DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 69 passed` / `result: OK`（exit 0） |
 | 单条披露 / 原版同形 / 一条 section / 别名开关 / restrict 不扩张 / PTC 补位单条 | **已实测（单元）** | `WF_ALIAS_HIDDEN` / `WF_STOCK_DEFINITION_PARITY` / `WF_SECTION_STOCK_ONCE` / `WF_ALIAS_SWITCH` / `WF_RESTRICT_NO_GRANT` / `WF_PTC_SUPPLEMENT` 各 PASS |
 | 标准/cordis 形态工具面单条 + section 一条 | **已实测（真实 Cordis 集成）** | ``scripts/probe-disclosure.mjs` 标准段 6/6 PASS（真 `tools.view()` / `systemPrompt.assemble()`） |
 | 标准/cordis 档**活宿主**重扫 | **未验证** | 运行中宿主是改动前旧模块（`link:` + 模块缓存），需重启复验 |

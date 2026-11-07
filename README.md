@@ -247,7 +247,7 @@ section）⇒ 我们这条 shadow 它；② PTC（库存 `tool-workflow` 被预�
 
 | 项 | 档位 | 证据 / 原因 |
 |---|---|---|
-| 统一 68 例自检全绿（含新增 10 例） | **已实测** | `DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 68 passed` / `result: OK`（exit 0） |
+| 统一 69 例自检全绿（含新增 11 例） | **已实测** | `DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 69 passed` / `result: OK`（exit 0） |
 | 真 Cordis + 真 `dsh-tools`/`dsh-system-prompt`/库存 `dsh-tool-workflow` 集成：标准档 agent 视图 workflow 名集合 = `['workflow']`、section 恰好一条且为库存正文 | **已实测（真实 Cordis 集成）** | ``scripts/probe-disclosure.mjs`（随包发布，可复跑）→ `result: OK (10/10)`（预设作用域挂库存工具、插件挂全局、agent 作用域经 `agent/created` 注入；断言读宿主真实 `tools.view()` 与 `systemPrompt.assemble()`） |
 | 同一集成下的 PTC 形态：无库存工具 + `run_code` 传输 ⇒ `workflow` 补位进视图、section 恰好一条、`run_workflow` 不出现 | **已实测（真实 Cordis 集成）** | 同上探针后半段 4 条断言全 PASS（`selectExecutor(agent).describe().knownNames` 含 `run_code` 时才补位） |
 | 单条披露：默认 agent 视图 workflow 名字集合 = `['workflow']`，全局无 `run_workflow` | **已实测（单元）** | 用例 `WF_ALIAS_HIDDEN` PASS（own 层恰好一条 `workflow`；可见 workflow 形状名恰好 `['workflow']`） |
@@ -431,10 +431,10 @@ DSH_HOST_MODULES="<…>/node_modules" node scripts/probe-disclosure.mjs    # 末
 `WF_PROGRESS_MIRROR`、`WF_RECORDER_EVENTS`、`WF_TRUNCATE_RESULT`、`WF_SHADOW_GUARD`、`WF_SYSTEM_PROMPT_SECTION`。
 0.5.0 的同名接管另有 7 例：`TAKEOVER_LISTENER`、`TAKEOVER_EXECUTE_DELEGATION`、`TAKEOVER_IDEMPOTENT`、
 `TAKEOVER_FALLBACK_GUARD`、`TAKEOVER_DISABLED`、`TAKEOVER_SKIP_ABSENT`、`TAKEOVER_ADOPT_OWN`。
-0.6.0 的单条披露/同形另有 10 例：`WF_STOCK_DEFINITION_PARITY`、`WF_ALIAS_HIDDEN`、`WF_ALIAS_SWITCH`、
+0.6.0 的单条披露/同形另有 11 例：`WF_STOCK_DEFINITION_PARITY`、`WF_ALIAS_HIDDEN`、`WF_ALIAS_SWITCH`、
 `WF_SECTION_STOCK_ONCE`、`WF_SECTION_SHADOWS_STOCK`、`WF_RESTRICT_NO_GRANT`、`WF_PTC_SUPPLEMENT`、
-`WF_ERROR_NAMES_CALLED_TOOL`、`TAKEOVER_FOREIGN_KEPT`、`WF_GLOSSARY_NO_DEAD_NAMES`。**当前总数 68 例，全绿时 `result: OK`**
-（`DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 68 passed`）。
+`WF_ERROR_NAMES_CALLED_TOOL`、`TAKEOVER_FOREIGN_KEPT`、`WF_GLOSSARY_NO_DEAD_NAMES`、`WF_RECORD_RESOLVES_EXTERNAL_CHILD_ID`。**当前总数 69 例，全绿时 `result: OK`**
+（`DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 69 passed`）。
 **这些是假 ctx 用例**：它们证明的是调用形状与事件订阅，不证明真机行为（见上方三档表）。
 
 ## 文件

@@ -104,7 +104,7 @@ PTC 的 `run_code` 是执行器 `describe()` 声明的 transport，**不进 regi
 
 | 项 | 档位 | 证据 / 原因 |
 |---|---|---|
-| 68 例自检全绿（含新增 10 例） | **已实测** | `DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 68 passed` / `result: OK`（exit 0） |
+| 69 例自检全绿（含新增 11 例） | **已实测** | `DSH_HOST_MODULES=… node scripts/check.mjs` → `cases: 69 passed` / `result: OK`（exit 0） |
 | 默认单条披露：workflow 形状名恰好 `['workflow']`，全局无 `run_workflow` | **已实测（单元）** | `WF_ALIAS_HIDDEN` PASS |
 | 原版同形（1667 字符 DESCRIPTION、四参数、required、结构化 meta） | **已实测（单元）** | `WF_STOCK_DEFINITION_PARITY` PASS |
 | 一条 section、库存逐字、无实现词；**注册在 agent 作用域并 shadow 预设那条**（全局 0 条） | **已实测（单元 + 真实 Cordis 集成）** | `WF_SECTION_STOCK_ONCE` / `WF_SECTION_SHADOWS_STOCK` / `WF_SYSTEM_PROMPT_SECTION` PASS；集成探针 `systemPrompt.assemble()` 组装后 1 条 |

@@ -1,6 +1,6 @@
 {
   "name": "dsh-subagent-dispatch",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "DeepSeek Harness plugin: dispatch subagents with per-call preset / reasoning_effort / model / provider / cwd / schema via the dispatch_subagent Host tool; run one workflow with per-run preset / reasoning_effort / model through the single model-facing `workflow` tool, served by taking the stock name over inside each agent's own scope; and expose an external `dispatch` subagent provider for whole-run workflow delegation. The `run_workflow` alias stays implemented but is not published by default (exposeRunWorkflow: true restores it).",
   "type": "module",
   "main": "lib/index.js",

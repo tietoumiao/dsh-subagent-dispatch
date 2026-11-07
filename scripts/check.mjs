@@ -2080,6 +2080,43 @@ await probe('WF_RECORDER_EVENTS', async () => {
   return 'run-start/agent-start/agent-end/run-end once each; refused append warns once and the tool still succeeds'
 })
 
+await probe('WF_RECORD_RESOLVES_EXTERNAL_CHILD_ID', async () => {
+  // With a per-run provider the engine only knows our synthesized id
+  // (`<provider>:<uuid>`). The durable record must carry the REAL child session
+  // id — that is what the Web UI opens when a member row is clicked.
+  const { state, parent, engine, emit } = mount()
+  const tool = state.tools.get(WF_TOOL_NAME)
+  const gate = deferred()
+  engine.behavior.gate = gate.promise
+  engine.behavior.value = { ok: true }
+  const execution = tool.execute({ script: WF_SCRIPT, meta: WF_META, preset: 'minimal' }, execFor(parent))
+  await tick()
+  const runId = engine.runs[0].runId
+  const providerName = state.tempProviderName
+  if (typeof providerName !== 'string') throw new Error('the per-run provider was not registered')
+  const provider = state.providers.get(providerName)
+  if (provider === undefined) throw new Error('the per-run provider is missing from the registry')
+  const handle = await provider.start({
+    parent,
+    prompt: [{ type: 'text', text: 'probe' }],
+    agentPreset: 'minimal',
+  })
+  const innerChildId = state.runs.at(-1)?.childId
+  if (typeof innerChildId !== 'string') throw new Error('the delegated activation produced no child id')
+  if (handle.id === innerChildId) throw new Error('the provider reused the host-owned child id (DUPLICATE_CHILD risk)')
+  emit('workflow/agent-start', { id: runId }, { seq: 1, label: 'delegated', childId: handle.id })
+  emit('workflow/agent-end', { id: runId }, { seq: 1, outcome: 'completed' })
+  gate.resolve()
+  await timed(execution, 'the recorded foreground call')
+  await handle.dispose()
+  const started = state.appends.find((entry) => entry.type === 'tool-workflow/agent-start')
+  if (started === undefined) throw new Error('no agent-start record was appended')
+  if (started.data.childId !== innerChildId) {
+    throw new Error(`the record kept the synthesized id instead of the session id: ${String(started.data.childId)}`)
+  }
+  return 'synthesized provider id → real child session id in the durable record'
+})
+
 await probe('WF_TRUNCATE_RESULT', async () => {
   const { state, parent, engine } = mount({ maxResultChars: 20 })
   const tool = state.tools.get(WF_TOOL_NAME)
